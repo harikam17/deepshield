@@ -1,81 +1,56 @@
-import hashlib
 import io
-import math
+import base64
+import requests
+import hashlib
 import struct
+import os
 
-try:
-    from PIL import Image
-    import numpy as np
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+HF_API_KEY = os.environ.get("HF_API_KEY", "")
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/dima806/deepfake_vs_real_image_detection"
 
 
 def analyze_image(image_bytes: bytes) -> tuple[str, float]:
-    """
-    Analyze image bytes and return (result, confidence).
-    Uses image-derived features for deterministic, realistic output.
-    """
-    if PIL_AVAILABLE:
-        return _analyze_with_pil(image_bytes)
+    if HF_API_KEY:
+        try:
+            return _analyze_with_huggingface(image_bytes)
+        except Exception as e:
+            print(f"HuggingFace API failed: {e}, falling back to local")
     return _analyze_fallback(image_bytes)
 
 
-def _analyze_with_pil(image_bytes: bytes) -> tuple[str, float]:
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_small = img.resize((64, 64))
-        arr = np.array(img_small, dtype=np.float32)
+def _analyze_with_huggingface(image_bytes: bytes) -> tuple[str, float]:
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    response = requests.post(
+        HF_MODEL_URL,
+        headers=headers,
+        data=image_bytes,
+        timeout=30
+    )
 
-        mean_r = float(np.mean(arr[:, :, 0]))
-        mean_g = float(np.mean(arr[:, :, 1]))
-        mean_b = float(np.mean(arr[:, :, 2]))
-        std_r = float(np.std(arr[:, :, 0]))
-        std_g = float(np.std(arr[:, :, 1]))
-        std_b = float(np.std(arr[:, :, 2]))
+    if response.status_code != 200:
+        raise Exception(f"API error: {response.status_code} {response.text}")
 
-        color_balance = abs(mean_r - mean_g) + abs(mean_g - mean_b)
-        texture_variance = (std_r + std_g + std_b) / 3.0
+    results = response.json()
 
-        sha = hashlib.sha256(image_bytes).digest()
-        seed_val = struct.unpack(">I", sha[:4])[0]
-        pseudo_rand = (seed_val % 1000) / 1000.0
+    if isinstance(results, dict) and "error" in results:
+        raise Exception(results["error"])
 
-        noise_score = _estimate_noise(arr)
+    real_score = 0.0
+    fake_score = 0.0
 
-        raw_score = (
-            0.30 * (color_balance / 255.0)
-            + 0.25 * (1.0 - texture_variance / 128.0)
-            + 0.25 * noise_score
-            + 0.20 * pseudo_rand
-        )
-        raw_score = max(0.0, min(1.0, raw_score))
+    for item in results:
+        label = item["label"].lower()
+        score = item["score"]
+        if "real" in label:
+            real_score = score
+        elif "fake" in label or "deepfake" in label or "artificial" in label:
+            fake_score = score
 
-        is_fake = raw_score > 0.48
+    is_fake = fake_score > real_score
+    confidence = round(max(fake_score, real_score) * 100, 2)
+    confidence = max(60.0, min(99.5, confidence))
 
-        if is_fake:
-            confidence = 60.0 + raw_score * 38.0
-        else:
-            confidence = 60.0 + (1.0 - raw_score) * 38.0
-
-        confidence = max(60.0, min(99.5, confidence))
-
-        return ("FAKE" if is_fake else "REAL", confidence)
-
-    except Exception:
-        return _analyze_fallback(image_bytes)
-
-
-def _estimate_noise(arr: "np.ndarray") -> float:
-    try:
-        import numpy as np
-        gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
-        diff_h = np.abs(np.diff(gray, axis=1))
-        diff_v = np.abs(np.diff(gray, axis=0))
-        noise = (float(np.mean(diff_h)) + float(np.mean(diff_v))) / 2.0
-        return min(noise / 30.0, 1.0)
-    except Exception:
-        return 0.5
+    return ("FAKE" if is_fake else "REAL", confidence)
 
 
 def _analyze_fallback(image_bytes: bytes) -> tuple[str, float]:
@@ -106,10 +81,8 @@ def get_stats_from_history(history: list) -> dict:
     fake_count = len(fake_entries)
     real_count = len(real_entries)
     fake_rate = round((fake_count / total) * 100, 1)
-
     confidences = [h.get("confidence", 0) for h in history]
-    avg_confidence = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
-
+    avg_confidence = round(sum(confidences) / len(confidences), 1)
     trend_source = list(reversed(history[:20]))
     confidence_trend = [
         {
